@@ -1,4 +1,3 @@
-
 name: Build WDTT Release
 
 on:
@@ -98,7 +97,6 @@ jobs:
 
           mkdir -p app/src/main/assets
 
-          # Android deploy code expects this exact asset name.
           cp build/server/wdtt-server-linux-amd64 app/src/main/assets/${SERVER_BINARY_NAME}
           chmod +x app/src/main/assets/${SERVER_BINARY_NAME}
 
@@ -180,9 +178,6 @@ jobs:
         shell: bash
         run: chmod +x ./gradlew
 
-      # ============================================================
-      # НОВЫЙ ШАГ: Проверка и подготовка ключа подписи
-      # ============================================================
       - name: Setup signing keystore (production or temporary)
         shell: bash
         run: |
@@ -194,7 +189,6 @@ jobs:
           echo "🔐 Проверка наличия ключей подписи..."
           echo "=========================================="
 
-          # Проверяем, заданы ли все необходимые секреты
           if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ] && \
              [ -n "${{ secrets.KEYSTORE_PASSWORD }}" ] && \
              [ -n "${{ secrets.KEY_ALIAS }}" ] && \
@@ -202,8 +196,6 @@ jobs:
 
             echo "✅ Найдены секреты для постоянного ключа."
             echo "   KEY_ALIAS: ${{ secrets.KEY_ALIAS }}"
-            echo "   KEYSTORE_PASSWORD: [скрыто]"
-            echo "   KEY_PASSWORD: [скрыто]"
 
             echo ""
             echo "📥 Декодируем KEYSTORE_BASE64 в release.keystore..."
@@ -211,31 +203,28 @@ jobs:
 
             echo ""
             echo "🔍 Проверяем целостность ключа..."
-            if ! keytool -list -keystore release.keystore -storepass "${{ secrets.KEYSTORE_PASSWORD }}" > /dev/null 2>&1; then
+
+            if ! keytool -list -keystore release.keystore -storepass "${{ secrets.KEYSTORE_PASSWORD }}" 2>/dev/null > /dev/null; then
               echo "❌ ОШИБКА: Неверный пароль хранилища (KEYSTORE_PASSWORD)!"
-              echo "   Файл release.keystore не может быть открыт."
               exit 1
             fi
 
-            if ! keytool -list -v -keystore release.keystore -storepass "${{ secrets.KEYSTORE_PASSWORD }}" -alias "${{ secrets.KEY_ALIAS }}" -keypass "${{ secrets.KEY_PASSWORD }}" > /dev/null 2>&1; then
+            if ! keytool -list -v -keystore release.keystore -storepass "${{ secrets.KEYSTORE_PASSWORD }}" -alias "${{ secrets.KEY_ALIAS }}" -keypass "${{ secrets.KEY_PASSWORD }}" 2>/dev/null > /dev/null; then
               echo "❌ ОШИБКА: Неверный KEY_ALIAS или KEY_PASSWORD!"
-              echo "   Не удалось извлечь сертификат по указанному алиасу."
               exit 1
             fi
 
             echo ""
             echo "✅ Ключ успешно проверен!"
             echo "   Информация о сертификате:"
-            keytool -list -v -keystore release.keystore -storepass "${{ secrets.KEYSTORE_PASSWORD }}" -alias "${{ secrets.KEY_ALIAS }}" | grep -E "Кол-во записей|Создан|DN|SHA-256"
+            keytool -list -v -keystore release.keystore -storepass "${{ secrets.KEYSTORE_PASSWORD }}" -alias "${{ secrets.KEY_ALIAS }}" 2>/dev/null | grep -E "Кол-во записей|Создан|DN|SHA-256" || true
 
-            # Сохраняем параметры подписи
             {
               echo "KEYSTORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}"
               echo "KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}"
               echo "KEY_ALIAS=${{ secrets.KEY_ALIAS }}"
             } > signing.env
 
-            # Создаём local.properties для Gradle (на случай, если Gradle понадобится)
             {
               echo "sdk.dir=${ANDROID_HOME}"
               echo "KEYSTORE_FILE=../release.keystore"
@@ -284,8 +273,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # No local.properties is created here, so Gradle produces unsigned release APKs.
-          # The workflow signs them manually in the next step using apksigner.
           ./gradlew clean :app:assembleRelease --stacktrace
 
       - name: Sign release APKs manually
