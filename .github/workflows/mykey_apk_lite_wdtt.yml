@@ -2,8 +2,8 @@
 name: Build WDTT Release
 
 on:
-  push:
-    branches:
+  #push:
+    #branches:
       - "**"
   workflow_dispatch:
 
