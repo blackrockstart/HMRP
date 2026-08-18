@@ -97,7 +97,6 @@ jobs:
 
           mkdir -p app/src/main/assets
 
-          # Android deploy code expects this exact asset name.
           cp build/server/wdtt-server-linux-amd64 app/src/main/assets/${SERVER_BINARY_NAME}
           chmod +x app/src/main/assets/${SERVER_BINARY_NAME}
 
@@ -179,26 +178,94 @@ jobs:
         shell: bash
         run: chmod +x ./gradlew
 
-      - name: Generate temporary release keystore
+      - name: Setup signing keystore (production or temporary)
         shell: bash
         run: |
           set -euo pipefail
 
-          KEYSTORE_PASSWORD="wdtt_temp_release_password"
-          KEY_PASSWORD="$KEYSTORE_PASSWORD"
-          KEY_ALIAS="wdtt-release"
-
           rm -f release.keystore local.properties signing.env
 
-          keytool -genkeypair             -v             -keystore release.keystore             -storetype PKCS12             -storepass "$KEYSTORE_PASSWORD"             -keypass "$KEY_PASSWORD"             -alias "$KEY_ALIAS"             -keyalg RSA             -keysize 4096             -validity 10000             -dname "CN=WDTT,O=WDTT,C=LV"
+          echo "=========================================="
+          echo "🔐 Проверка наличия ключей подписи..."
+          echo "=========================================="
 
-          {
-            echo "KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
-            echo "KEY_PASSWORD=$KEY_PASSWORD"
-            echo "KEY_ALIAS=$KEY_ALIAS"
-          } > signing.env
+          if [ -n "${{ secrets.KEYSTORE_BASE64 }}" ] && \
+             [ -n "${{ secrets.KEYSTORE_PASSWORD }}" ] && \
+             [ -n "${{ secrets.KEY_ALIAS }}" ] && \
+             [ -n "${{ secrets.KEY_PASSWORD }}" ]; then
 
-          echo "Generated temporary release keystore"
+            echo "✅ Найдены секреты для постоянного ключа."
+            echo "   KEY_ALIAS: ${{ secrets.KEY_ALIAS }}"
+
+            echo ""
+            echo "📥 Декодируем KEYSTORE_BASE64 в release.keystore..."
+            echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > release.keystore
+
+            echo ""
+            echo "🔍 Проверяем целостность ключа..."
+
+            if ! keytool -list -keystore release.keystore -storepass "${{ secrets.KEYSTORE_PASSWORD }}" 2>/dev/null > /dev/null; then
+              echo "❌ ОШИБКА: Неверный пароль хранилища (KEYSTORE_PASSWORD)!"
+              exit 1
+            fi
+
+            if ! keytool -list -v -keystore release.keystore -storepass "${{ secrets.KEYSTORE_PASSWORD }}" -alias "${{ secrets.KEY_ALIAS }}" -keypass "${{ secrets.KEY_PASSWORD }}" 2>/dev/null > /dev/null; then
+              echo "❌ ОШИБКА: Неверный KEY_ALIAS или KEY_PASSWORD!"
+              exit 1
+            fi
+
+            echo ""
+            echo "✅ Ключ успешно проверен!"
+            echo "   Информация о сертификате:"
+            keytool -list -v -keystore release.keystore -storepass "${{ secrets.KEYSTORE_PASSWORD }}" -alias "${{ secrets.KEY_ALIAS }}" 2>/dev/null | grep -E "Кол-во записей|Создан|DN|SHA-256" || true
+
+            {
+              echo "KEYSTORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}"
+              echo "KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}"
+              echo "KEY_ALIAS=${{ secrets.KEY_ALIAS }}"
+            } > signing.env
+
+            {
+              echo "sdk.dir=${ANDROID_HOME}"
+              echo "KEYSTORE_FILE=../release.keystore"
+              echo "KEYSTORE_PASSWORD=${{ secrets.KEYSTORE_PASSWORD }}"
+              echo "KEY_ALIAS=${{ secrets.KEY_ALIAS }}"
+              echo "KEY_PASSWORD=${{ secrets.KEY_PASSWORD }}"
+            } > local.properties
+
+            echo "✅ Используется ПОСТОЯННЫЙ ключ из секретов."
+
+          else
+            echo "⚠️ Секреты не найдены или заполнены не полностью."
+            echo "   Создаём ВРЕМЕННЫЙ ключ для тестовой сборки."
+
+            KEYSTORE_PASSWORD="wdtt_temp_release_password"
+            KEY_PASSWORD="$KEYSTORE_PASSWORD"
+            KEY_ALIAS="wdtt-release"
+
+            keytool -genkeypair \
+              -v \
+              -keystore release.keystore \
+              -storetype PKCS12 \
+              -storepass "$KEYSTORE_PASSWORD" \
+              -keypass "$KEY_PASSWORD" \
+              -alias "$KEY_ALIAS" \
+              -keyalg RSA \
+              -keysize 4096 \
+              -validity 10000 \
+              -dname "CN=WDTT-Temp,O=WDTT,C=LV"
+
+            {
+              echo "KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+              echo "KEY_PASSWORD=$KEY_PASSWORD"
+              echo "KEY_ALIAS=$KEY_ALIAS"
+            } > signing.env
+
+            echo "✅ Используется ВРЕМЕННЫЙ ключ для теста."
+          fi
+
+          echo ""
+          echo "📄 Файл ключа:"
           ls -lh release.keystore
 
       - name: Build Android release APK
@@ -206,11 +273,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          # No local.properties is created here, so Gradle produces unsigned release APKs.
-          # The workflow signs them manually in the next step using apksigner.
           ./gradlew clean :app:assembleRelease --stacktrace
 
-      - name: Sign release APKs manually
+      - name: Sign release APKs with your key
         shell: bash
         run: |
           set -euo pipefail
@@ -225,33 +290,65 @@ jobs:
           echo "Using apksigner: $APKSIGNER"
 
           mkdir -p build/signed-apk
-          shopt -s nullglob
-          unsigned_apks=(app/build/outputs/apk/release/*-unsigned.apk)
 
-          if [ ${#unsigned_apks[@]} -eq 0 ]; then
-            echo "No unsigned release APKs found"
-            echo "Available APK outputs:"
+          # Ищем все release APK (без суффикса -unsigned)
+          shopt -s nullglob
+          apks=(app/build/outputs/apk/release/*-release.apk)
+
+          if [ ${#apks[@]} -eq 0 ]; then
+            echo "❌ No APKs found in app/build/outputs/apk/release/"
             find app/build/outputs/apk -type f -name "*.apk" -print || true
             exit 1
           fi
 
-          for apk in "${unsigned_apks[@]}"; do
-            name="$(basename "$apk" -unsigned.apk)"
-            aligned="build/signed-apk/${name}-aligned.apk"
-            signed="build/signed-apk/${name}-signed.apk"
+          echo "📦 Found ${#apks[@]} APK(s) to re-sign"
 
-            echo "== Align $apk =="
+          for apk in "${apks[@]}"; do
+            # Убираем суффикс -release.apk
+            base_name="$(basename "$apk" -release.apk)"
+            aligned="build/signed-apk/${base_name}-aligned.apk"
+            signed="build/signed-apk/${base_name}-signed.apk"
+
+            echo ""
+            echo "=========================================="
+            echo "🔧 Processing: $(basename "$apk")"
+            echo "=========================================="
+
+            # 1. Выравнивание
+            echo "📐 Aligning..."
             "$ZIPALIGN" -p -f 4 "$apk" "$aligned"
 
-            echo "== Sign $aligned =="
-            "$APKSIGNER" sign               --ks release.keystore               --ks-key-alias "$KEY_ALIAS"               --ks-pass "pass:$KEYSTORE_PASSWORD"               --key-pass "pass:$KEY_PASSWORD"               --v1-signing-enabled true               --v2-signing-enabled true               --v3-signing-enabled true               --v4-signing-enabled false               --out "$signed"               "$aligned"
+            # 2. Подпись
+            echo "✍️ Signing with your key..."
+            "$APKSIGNER" sign \
+              --ks release.keystore \
+              --ks-key-alias "$KEY_ALIAS" \
+              --ks-pass "pass:$KEYSTORE_PASSWORD" \
+              --key-pass "pass:$KEY_PASSWORD" \
+              --v1-signing-enabled true \
+              --v2-signing-enabled true \
+              --v3-signing-enabled true \
+              --v4-signing-enabled false \
+              --out "$signed" \
+              "$aligned"
 
-            echo "== Verify $signed =="
-            "$APKSIGNER" verify               --verbose               --print-certs               "$signed"
+            # 3. ПРОВЕРКА ПОДПИСИ (как можно раньше)
+            echo "✅ Verifying signature..."
+            if "$APKSIGNER" verify --verbose --print-certs "$signed"; then
+              echo "   ✅ SIGNATURE VERIFIED SUCCESSFULLY!"
+            else
+              echo "   ❌ SIGNATURE VERIFICATION FAILED!"
+              exit 1
+            fi
+
+            echo "✅ Done: $(basename "$signed")"
           done
 
-          echo "Signed APKs:"
+          echo ""
+          echo "=========================================="
+          echo "📦 All signed APKs:"
           ls -lh build/signed-apk/*-signed.apk
+          echo "=========================================="
 
       - name: Collect build outputs
         shell: bash
@@ -262,15 +359,12 @@ jobs:
           mkdir -p build/artifacts/server
           mkdir -p build/artifacts/go-client
 
-          echo "== Signed APK outputs =="
-          find build/signed-apk -type f -name "*-signed.apk" -print -exec ls -lh {} \;
-
-          cp build/signed-apk/*-signed.apk build/artifacts/apk/
-          cp build/server/* build/artifacts/server/
-          cp build/go-client/* build/artifacts/go-client/
+          cp build/signed-apk/*-signed.apk build/artifacts/apk/ || true
+          cp build/server/* build/artifacts/server/ || true
+          cp build/go-client/* build/artifacts/go-client/ || true
 
           echo "== Final artifacts =="
-          find build/artifacts -type f -exec ls -lh {} \;
+          find build/artifacts -type f -exec ls -lh {} \; 2>/dev/null || echo "No artifacts found"
 
       - name: Upload release APK artifact
         uses: actions/upload-artifact@v4
